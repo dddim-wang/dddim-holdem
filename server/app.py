@@ -66,6 +66,7 @@ class Player:
     cards: List[str] = field(default_factory=list)
     raises: int = 0  # cumulative count of bets (4 or 8) made
     action_submitted: bool = False
+    pot: int = 0
 
 @dataclass
 class Game:
@@ -78,6 +79,8 @@ class Game:
     pot: int = 0
     round_actions: Dict[str, str] = field(default_factory=dict)  # sid -> action
     someone_raised: bool = False
+    current_bet: int = 0  # highest bet in current round
+    raise_made: bool = False  # whether someone has already raised in this round
     max_players: int = 15
 
     def reset_deck(self):
@@ -95,7 +98,7 @@ class Game:
 
     def everyone_acted(self) -> bool:
         for sid in self.active_sids():
-            if not self.players[sid].action_submitted:
+            if not self.players[sid].action_submitted and not self.players[sid].name.startswith("Host-"):
                 return False
         return True
 
@@ -192,12 +195,15 @@ HAND_NAME = {
 def best_hand(hole: List[str], board: List[str]):
     best = None
     best5 = None
+    print(f"DEBUG: Evaluating hand for hole cards {hole} and board {board}")
     for combo in combinations(hole + board, 5):
         score = classify_5(list(combo))
         if (best is None) or (score > best):
             best = score
             best5 = list(combo)
+            print(f"DEBUG: New best hand: {combo} with score {score}")
     hand_name = HAND_NAME[best[0]]
+    print(f"DEBUG: Final best hand: {best5} with name {hand_name}")
     return best, best5, hand_name
 
 # --- REST: auth & comments & rankings ---
@@ -215,7 +221,9 @@ def register():
             conn.commit()
     except sqlite3.IntegrityError:
         return jsonify({"error": "username already exists"}), 409
-    return jsonify({"ok": True})
+    # Auto-login after registration by returning access token
+    token = create_access_token(identity=username)
+    return jsonify({"access_token": token, "username": username})
 
 @app.post("/api/login")
 def login():
@@ -312,6 +320,7 @@ def join_game(data):
 
 @sio.on("host_start")
 def host_start(data):
+    print("Host started game.")
     game_id = (data or {}).get("gameId")
     if game_id not in GAMES:
         return emit("error", {"error": "Game not found"})
@@ -324,10 +333,13 @@ def host_start(data):
     g.pot = 0
     g.stage = "preflop"
     g.someone_raised = False
+    g.current_bet = 0
+    g.raise_made = False
     for p in g.players.values():
         p.in_hand = True
         p.action_submitted = False
         p.raises = 0
+        p.pot = 0
         p.cards = []
     g.deal_to_all()
     # send private cards
@@ -338,7 +350,7 @@ def host_start(data):
 @sio.on("player_action")
 def player_action(data):
     game_id = (data or {}).get("gameId")
-    action = (data or {}).get("action")  # check, bet4, bet8, fold
+    action = (data or {}).get("action")  # check, bet4, bet8, call, fold, raise
     if game_id not in GAMES:
         return emit("error", {"error": "Game not found"})
     g = GAMES[game_id]
@@ -350,21 +362,53 @@ def player_action(data):
     if p.action_submitted:
         return  # one action per round
 
+    # Check if player needs to call (they're below current bet)
+    needs_to_call = p.pot < g.current_bet
+
     if action == "fold":
         p.in_hand = False
         p.action_submitted = True
     elif action == "check":
+        if needs_to_call:
+            return emit("error", {"error": "Must call or fold - cannot check"})
+        p.action_submitted = True
+    elif action == "call":
+        if not needs_to_call:
+            return emit("error", {"error": "No need to call - you can check"})
+        call_amount = g.current_bet - p.pot
+        p.pot += call_amount
+        g.pot += call_amount
         p.action_submitted = True
     elif action == "bet4":
+        # If current bet is 8, bet4 is not allowed (must call 8 or raise to 12)
+        if g.current_bet == 8:
+            return emit("error", {"error": "Cannot bet 4 when current bet is 8. Must call 8 or raise to 12"})
+        # If someone already raised in this round, can't bet 4 anymore
+        if g.raise_made:
+            return emit("error", {"error": "Someone already raised in this round. You can only call or fold."})
+        p.pot += 4
         g.pot += 4
         p.raises += 1
         p.action_submitted = True
         g.someone_raised = True
+        g.current_bet = max(g.current_bet, p.pot)
+        print(f"Player {p.name} bet 4. Current bet now: {g.current_bet}, Player pot: {p.pot}")
     elif action == "bet8":
+        # If someone already raised in this round, can't raise again
+        if g.raise_made:
+            return emit("error", {"error": "Someone already raised in this round. You can only call or fold."})
+        p.pot += 8
         g.pot += 8
         p.raises += 1
         p.action_submitted = True
         g.someone_raised = True
+        g.raise_made = True  # Mark that a raise has been made
+        g.current_bet = max(g.current_bet, p.pot)
+        # Reset action_submitted for all other players so they can act again
+        for other_p in g.players.values():
+            if other_p.sid != p.sid:
+                other_p.action_submitted = False
+        print(f"Player {p.name} bet 8. Current bet now: {g.current_bet}, Player pot: {p.pot}")
     else:
         return emit("error", {"error": "Invalid action"})
 
@@ -374,19 +418,24 @@ def player_action(data):
 
 @sio.on("host_deal_next")
 def host_deal_next(data):
+    print("Host dealt next cards.")
     game_id = (data or {}).get("gameId")
+    print(game_id)
     if game_id not in GAMES:
         return emit("error", {"error": "Game not found"})
     g = GAMES[game_id]
+    print(g)
     if request.sid != g.host_sid:
         return emit("error", {"error": "Only host can deal"})
 
     # Ensure all active players acted
     if not g.everyone_acted() and g.stage != "lobby":
+        print("Not all players have acted.")
         return emit("error", {"error": "Wait for all players"})
 
     # Advance stage & reveal board
     if g.stage == "preflop":
+        print("Preflop stage dealing next cards...")
         # reveal 2 (first flop)
         g.board.append(g.deck.pop())
         g.board.append(g.deck.pop())
@@ -403,6 +452,10 @@ def host_deal_next(data):
     elif g.stage == "river":
         g.stage = "showdown"
         winners = compute_winners(g)
+        print(f"DEBUG: Sending showdown results: {winners}")
+        print(f"DEBUG: Winners array type: {type(winners['winners'])}")
+        print(f"DEBUG: Winners array content: {winners['winners']}")
+        print(f"DEBUG: Winners array length: {len(winners['winners'])}")
         sio.emit("showdown", winners, to=g.game_id)
         sio.emit("state", serialize_game(g), to=g.game_id)
         return
@@ -412,6 +465,8 @@ def host_deal_next(data):
         if p.in_hand:
             p.action_submitted = False
     g.someone_raised = False
+    g.current_bet = 0
+    g.raise_made = False
 
     sio.emit("state", serialize_game(g), to=g.game_id)
 
@@ -434,11 +489,14 @@ def host_reset_round(data):
     g.pot = 0
     g.stage = "preflop"
     g.someone_raised = False
+    g.current_bet = 0
+    g.raise_made = False
     g.reset_deck()
     for p in g.players.values():
         p.in_hand = True
         p.action_submitted = False
         p.raises = 0
+        p.pot = 0
         p.cards = []
     g.deal_to_all()
     for p in g.players.values():
@@ -456,33 +514,47 @@ def compute_winners(g: Game):
     for p in contenders:
         score, five, name = best_hand(p.cards, g.board)
         scored.append((score, p, name, five))
+        print(f"DEBUG: Player {p.name} has cards {p.cards}, board is {g.board}, best hand: {name}, score: {score}")
     scored.sort(reverse=True, key=lambda t: t[0])
     top = scored[0][0]
     winners = [s[1].name for s in scored if s[0] == top]
+    print(f"DEBUG: Top score is {top}, winners are {winners}")
+    print(f"DEBUG: All player names in game: {[p.name for p in g.players.values()]}")
     return {
         "winners": winners,
         "pot": g.pot,
         "board": g.board,
-        "hand_name": HAND_NAME[top[0]],
+        "hand_name": HAND_NAME[top[0]],  # This is the winning hand name
         "show": [
-            {"name": s[1].name, "cards": s[1].cards, "best5": s[3], "score": str(s[0])} for s in scored
+            {"name": s[1].name, "cards": s[1].cards, "best5": s[3], "score": str(s[0]), "hand_name": s[2]} for s in scored
         ],
     }
 
 def serialize_game(g: Game):
-    return {
+    result = {
         "gameId": g.game_id,
         "stage": g.stage,
         "board": g.board,
         "pot": g.pot,
         "someoneRaised": g.someone_raised,
+        "currentBet": g.current_bet,
+        "raiseMade": g.raise_made,
         "players": [
-            {"name": p.name, "inHand": p.in_hand, "raises": p.raises, "acted": p.action_submitted}
+            {
+                "name": p.name, 
+                "inHand": p.in_hand, 
+                "raises": p.raises, 
+                "acted": p.action_submitted, 
+                "pot": p.pot,
+                "needsToCall": p.in_hand and p.pot < g.current_bet and not p.action_submitted
+            }
             for p in g.players.values()
         ],
         "count": len(g.players),
         "max": g.max_players,
     }
+    print(f"Serialized game - Current bet: {g.current_bet}, Raise made: {g.raise_made}, Players: {[(p.name, p.pot, p.in_hand and p.pot < g.current_bet and not p.action_submitted) for p in g.players.values()]}")
+    return result
 
 if __name__ == "__main__":
     # Run with eventlet for WebSockets
